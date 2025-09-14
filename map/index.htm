@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Surfshark Server Map (Latest)</title>
+  <link rel="stylesheet" href="style.css" />
+  
+  <!-- MapLibre (vector) -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css">
+  <script defer src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
+  <!-- Leaflet (raster fallback) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet MarkerCluster (for raster fallback clustering) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+  <script defer src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <h1>Surfshark Servers</h1>
+      <input id="search" placeholder="Filter countries or cities… (Enter to jump to a city)" />
+      <div id="list"></div>
+      <footer>
+        Data from <a href="https://surfshark.com/servers" target="_blank" rel="noopener">Surfshark</a>.
+      </footer>
+    </aside>
+    <main id="map"></main>
+  </div>
+
+  <script type="module">
+    const MAPTILER_KEY = localStorage.getItem('MAPTILER_KEY') || '';
+    const isVector = !!MAPTILER_KEY;
+
+    const serversUrl = '../data/servers.json';
+    const serversGeoUrl = '../data/servers_geocoded.json';
+    const countriesUrl = './countries.geojson';
+
+    const state = { servers: {}, serversGeo: {}, countries: null };
+
+    const dom = {
+      list: document.getElementById('list'),
+      search: document.getElementById('search'),
+    };
+
+    // Build a quick index for city name -> {lat,lng,country}
+    const cityIndex = new Map();
+    function buildCityIndex() {
+      cityIndex.clear();
+      for (const [country, arr] of Object.entries(state.serversGeo || {})) {
+        (arr || []).forEach(({ name, lat, lng }) => {
+          if (typeof lat === 'number' && typeof lng === 'number' && name) {
+            const key = name.toLowerCase();
+            if (!cityIndex.has(key)) cityIndex.set(key, []);
+            cityIndex.get(key).push({ country, name, lat, lng });
+          }
+        });
+      }
+    }
+
+    // --- UI helpers ---
+    function renderList(filter='') {
+      const f = filter.toLowerCase().trim();
+      const frag = document.createDocumentFragment();
+      Object.entries(state.servers).forEach(([country, cities]) => {
+        const hits = [country, ...cities].some(s => s.toLowerCase().includes(f));
+        if (!hits) return;
+        const div = document.createElement('div');
+        div.className = 'country';
+        div.innerHTML = `<h3>${country}</h3><p>${cities.join(', ') || '<i>city list unavailable</i>'}</p>`;
+        div.onclick = () => zoomToCountry(country);
+        frag.appendChild(div);
+      });
+      dom.list.replaceChildren(frag);
+    }
+
+    // Jump to a unique city on Enter
+    dom.search.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      const q = dom.search.value.trim().toLowerCase();
+      if (!q) return;
+      const matches = cityIndex.get(q) || [];
+      if (matches.length === 1) {
+        const { lat, lng, name, country } = matches[0];
+        zoomToCity({ lat, lng, name, country });
+      }
+    });
+
+    // Also filter the list live
+    dom.search.addEventListener('input', e => renderList(e.target.value));
+
+    // --- Map init (vector first) ---
+    let map, vectorLayerId = 'countries';
+    let leafletCluster = null;
+
+    async function initVector() {
+      map = new maplibregl.Map({
+        container: 'map',
+        style: `https://api.maptiler.com/maps/streets/style.json?key=${MAPTILER_KEY}`,
+        center: [10, 20], zoom: 1.6
+      });
+      map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+      map.on('load', async () => {
+        const srcId = 'countries';
+        map.addSource(srcId, { type: 'geojson', data: countriesUrl, promoteId: 'NAME' });
+        map.addLayer({ id: vectorLayerId, type: 'fill', source: srcId,
+          paint: { 'fill-color': '#4aa0ff', 'fill-opacity': 0.08 } });
+        map.addLayer({ id: 'country-borders', type: 'line', source: srcId,
+          paint: { 'line-color': '#4aa0ff', 'line-width': 0.6, 'line-opacity': 0.5 } });
+
+        map.on('click', vectorLayerId, (e) => {
+          const feature = e.features?.[0];
+          if (!feature) return;
+          const name = feature.properties.NAME;
+          zoomToCountry(name);
+        });
+        map.on('mousemove', vectorLayerId, () => map.getCanvas().style.cursor = 'pointer');
+        map.on('mouseleave', vectorLayerId, () => map.getCanvas().style.cursor = '');
+
+        // ---- City markers & clustering (MapLibre) ----
+        const cityFeatures = [];
+        for (const [country, cities] of Object.entries(state.serversGeo || {})) {
+          (cities || []).forEach(({ name, lat, lng }) => {
+            if (typeof lat !== 'number' || typeof lng !== 'number') return;
+            cityFeatures.push({
+              type: 'Feature',
+              geometry: { type: 'Point', coordinates: [lng, lat] },
+              properties: { country, city: name }
+            });
+          });
+        }
+        if (cityFeatures.length) {
+          map.addSource('cities', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: cityFeatures },
+            cluster: true,
+            clusterRadius: 40,
+            clusterMaxZoom: 10
+          });
+          map.addLayer({ id: 'clusters', type: 'circle', source: 'cities',
+            filter: ['has', 'point_count'],
+            paint: {
+              'circle-radius': ['step', ['get', 'point_count'], 12, 20, 16, 50, 22],
+              'circle-color': '#3b82f6',
+              'circle-opacity': 0.75
+            }
+          });
+          map.addLayer({ id: 'cluster-count', type: 'symbol', source: 'cities',
+            filter: ['has', 'point_count'],
+            layout: { 'text-field': ['get','point_count_abbreviated'], 'text-size': 12 },
+            paint: { 'text-color': '#fff' }
+          });
+          map.addLayer({ id: 'unclustered', type: 'circle', source: 'cities',
+            filter: ['!', ['has','point_count']],
+            paint: {
+              'circle-radius': 5,
+              'circle-color': '#111827',
+              'circle-stroke-width': 1.5,
+              'circle-stroke-color': '#ffffff'
+            }
+          });
+
+          const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: true });
+          map.on('click', 'clusters', (e) => {
+            const f = e.features[0];
+            const src = map.getSource('cities');
+            src.getClusterExpansionZoom(f.properties.cluster_id, (err, zoom) => {
+              if (err) return;
+              map.easeTo({ center: f.geometry.coordinates, zoom });
+            });
+          });
+          map.on('click', 'unclustered', (e) => {
+            const f = e.features[0];
+            const { country, city } = f.properties;
+            popup.setLngLat(f.geometry.coordinates)
+                 .setHTML(`<strong>${city}</strong><br>${country}`)
+                 .addTo(map);
+          });
+          map.on('mouseenter', 'unclustered', () => map.getCanvas().style.cursor = 'pointer');
+          map.on('mouseleave', 'unclustered', () => map.getCanvas().style.cursor = '');
+        }
+
+        renderList();
+      });
+    }
+
+    async function initRaster() {
+      map = L.map('map', { worldCopyJump: true }).setView([20, 10], 2);
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png', {
+        attribution: '&copy; OpenStreetMap & Carto'
+      }).addTo(map);
+
+      const resp = await fetch(countriesUrl);
+      const gj = await resp.json();
+      const layer = L.geoJSON(gj, { style: { color: '#4aa0ff', weight: 1, fillOpacity: 0.08 } }).addTo(map);
+      layer.eachLayer(l => l.on('click', () => {
+        const name = l.feature.properties.NAME;
+        zoomToCountry(name);
+      }));
+
+      // ---- City markers & clustering (Leaflet) ----
+      const features = [];
+      for (const [country, cities] of Object.entries(state.serversGeo || {})) {
+        (cities || []).forEach(({ name, lat, lng }) => {
+          if (typeof lat === 'number' && typeof lng === 'number') {
+            features.push({ country, name, lat, lng });
+          }
+        });
+      }
+      if (features.length) {
+        leafletCluster = L.markerClusterGroup({ maxClusterRadius: 40 });
+        features.forEach(({ country, name, lat, lng }) => {
+          const m = L.marker([lat, lng]).bindPopup(`<strong>${name}</strong><br>${country}`);
+          leafletCluster.addLayer(m);
+        });
+        map.addLayer(leafletCluster);
+      }
+
+      renderList();
+    }
+
+    async function zoomToCountry(name) {
+      const feature = state.countries.features.find(f => (f.properties.NAME || '').toLowerCase() === name.toLowerCase());
+      if (!feature) return;
+
+      if (isVector) {
+        const bbox = turf.bbox(feature);
+        map.fitBounds(bbox, { padding: 40, duration: 600 });
+      } else {
+        const layer = L.geoJSON(feature);
+        map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+      }
+    }
+
+    function zoomToCity({ lat, lng, name, country }) {
+      if (isVector) {
+        map.easeTo({ center: [lng, lat], zoom: 8 });
+        new maplibregl.Popup({ closeButton:false, closeOnClick:true })
+          .setLngLat([lng, lat]).setHTML(`<strong>${name}</strong><br>${country}`).addTo(map);
+      } else {
+        map.setView([lat, lng], 8);
+        L.popup().setLatLng([lat, lng]).setContent(`<strong>${name}</strong><br>${country}`).openOn(map);
+      }
+    }
+
+    // --- Load data + boot ---
+    const [servers, countries, serversGeo] = await Promise.all([
+      fetch(serversUrl).then(r => r.json()),
+      fetch(countriesUrl).then(r => r.json()),
+      fetch(serversGeoUrl).then(r => r.ok ? r.json() : (console.warn('No servers_geocoded.json found; skipping markers'), {}))
+    ]);
+    state.servers = servers;
+    state.countries = countries;
+    state.serversGeo = serversGeo;
+    buildCityIndex();
+
+    if (isVector) {
+      // Load Turf (bbox) only when needed
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/@turf/turf@6.5.0/turf.min.js';
+      s.onload = initVector;
+      document.body.appendChild(s);
+    } else {
+      initRaster();
+    }
+  </script>
+</body>
+</html>

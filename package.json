@@ -1,0 +1,29 @@
+{
+  "name": "tonyser96.github.io",
+  "version": "1.0.0",
+  "description": "my homepage",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tonyser96/tonyser96.github.io.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/tonyser96/tonyser96.github.io/issues"
+  },
+  "homepage": "https://github.com/tonyser96/tonyser96.github.io#readme",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "p-queue": "^8.1.1"
+  },
+  "devDependencies": {
+    "cheerio": "^1.1.2",
+    "playwright": "^1.55.0"
+  }
+}
